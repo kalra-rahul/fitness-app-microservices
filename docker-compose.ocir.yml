@@ -1,0 +1,184 @@
+version: "3.9"
+
+services:
+
+  # =========================================================
+  # INFRASTRUCTURE (pulled from Docker Hub)
+  # =========================================================
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: fitness-postgres
+    environment:
+      POSTGRES_DB: fitness-micro-user
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgress
+    ports:
+      - "5432:5432"
+
+  mongodb:
+    image: mongo:7
+    container_name: fitness-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    container_name: fitness-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    container_name: fitness-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.0
+    container_name: fitness-keycloak
+    command: start-dev --import-realm
+    environment:
+      KC_HOSTNAME_URL: http://localhost:8181
+      KC_HOSTNAME_ADMIN_URL: http://localhost:8181
+      KC_HOSTNAME_STRICT: false
+      KC_PROXY: edge
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8181:8080"
+
+  # =========================================================
+  # SPRING BOOT MICROSERVICES (pulled from OCIR)
+  # =========================================================
+
+  config-server:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-config-server:1.0
+    container_name: fitness-config-server
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8888/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  eureka:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-eureka:1.0
+    container_name: fitness-eureka
+    ports:
+      - "8761:8761"
+    depends_on:
+      config-server:
+        condition: service_healthy
+    environment:
+      SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka:8761/eureka/
+
+  user-service:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-user-service:1.0
+    container_name: fitness-user-service
+    ports:
+      - "8001:8001"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+      postgres:
+        condition: service_started
+    environment:
+      SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fitness-micro-user
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgress
+
+  activity-service:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-activity-service:1.0
+    container_name: fitness-activity-service
+    ports:
+      - "8002:8002"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+      mongodb:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka:8761/eureka/
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/fitnessactivity
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_NAME: activity-events
+
+  ai-service:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-ai-service:1.0
+    container_name: fitness-ai-service
+    ports:
+      - "8003:8003"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+      mongodb:
+        condition: service_started
+      kafka:
+        condition: service_started
+    environment:
+      SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka:8761/eureka/
+      SPRING_DATA_MONGODB_URI: mongodb://mongodb:27017/fitnessrecommendation
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      GEMINI_API_URL: ${GEMINI_API_URL}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+  gateway:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-gateway:1.0
+    container_name: fitness-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_started
+      user-service:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    environment:
+      SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka:8761/eureka/
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8181/realms/master/protocol/openid-connect/certs
+
+  frontend:
+    image: iad.ocir.io/REPLACE_WITH_NAMESPACE/fitness-frontend:1.0
+    container_name: fitness-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - gateway
+    environment:
+      VITE_API_URL: http://REPLACE_WITH_VM_PUBLIC_IP:8080/api
+      VITE_KEYCLOAK_URL: http://REPLACE_WITH_VM_PUBLIC_IP:8181
+
+volumes:
+  mongodb_data:
